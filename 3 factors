@@ -1,155 +1,756 @@
-import pandas as pd
 import numpy as np
-from sklearn.svm import SVC
-from sklearn.decomposition import PCA
+import pandas as pd
+from pathlib import Path
 import matplotlib.pyplot as plt
-import os
+from matplotlib.ticker import FixedLocator, FormatStrFormatter
+from sklearn.svm import SVC
+from sklearn.model_selection import RepeatedStratifiedKFold
+from sklearn.decomposition import PCA
+from datetime import datetime
+import json
 
-# Set global font, font size, tick size, and line width
+DATA_FILE = Path(r"xx.csv")
+NEW_DATA_FILE = DATA_FILE.with_name("xx.csv")
+N_FEATURES = 3
+STEM = DATA_FILE.stem
+NEW_STEM = NEW_DATA_FILE.stem + "-new"
+OUT_DIR = DATA_FILE.parent / STEM
+OUT_DIR.mkdir(parents=True, exist_ok=True)
+
+N_SPLITS = 4
+N_REPEATS = 1000
+SEED = 20260131
+
+title_TEST  = r"Test set ($E-E_{\infty}-\mu$)"
+title_TRAIN = r"Train set ($E-E_{\infty}-\mu$)"
+
+PC1_LABEL = r"PC1"
+PC2_LABEL = r"PC2"
+
+CLASS_NAMES = ["0 h", "4 h"]
+
 plt.rcParams['font.family'] = 'Arial'
 plt.rcParams['font.size'] = 48
-plt.rcParams['xtick.major.size'] = 8  
-plt.rcParams['ytick.major.size'] = 8 
-plt.rcParams['lines.linewidth'] = 2 
-plt.rcParams['axes.linewidth'] = 2  
+plt.rcParams['xtick.major.size'] = 8
+plt.rcParams['ytick.major.size'] = 8
+plt.rcParams['lines.linewidth'] = 2
+plt.rcParams['axes.linewidth'] = 2
 
-os.chdir("")  # Change current working directory
+EPS = 1e-12
+PLANE_GRID_N = 80
 
-# Load data
-def load_data(file_name):
-    return pd.read_csv(file_name, header=None)
+def load_data(file_path: str):
+    df = pd.read_csv(file_path, header=None)
+    if df.shape[1] < N_FEATURES + 1:
+        raise ValueError(f"CSV must contain at least {N_FEATURES + 1} columns: x1, x2, x3, label(1/2)")
 
-# Train SVM model
+    X = df.iloc[:, :N_FEATURES].to_numpy(dtype=float)
+    y = df.iloc[:, N_FEATURES].to_numpy()
+
+    uniq = np.unique(y)
+    if not set(uniq).issubset({1, 2}):
+        raise ValueError(f"Labels must be 1 or 2. Detected: {uniq}")
+
+    n1 = np.sum(y == 1)
+    n2 = np.sum(y == 2)
+    if n1 < N_SPLITS or n2 < N_SPLITS:
+        raise ValueError(f"Each class must have at least n_splits={N_SPLITS} samples. Current Class1={n1}, Class2={n2}")
+
+    return X, y
+
+def load_external_data(file_path: str):
+    df = pd.read_csv(file_path, header=None)
+    if df.shape[1] < N_FEATURES + 1:
+        raise ValueError(f"External CSV must contain at least {N_FEATURES + 1} columns: x1, x2, x3, label(1/2)")
+    X = df.iloc[:, :N_FEATURES].to_numpy(dtype=float)
+    y = df.iloc[:, N_FEATURES].to_numpy()
+
+    uniq = np.unique(y)
+    if not set(uniq).issubset({1, 2}):
+        raise ValueError(f"External labels must be 1 or 2. Detected: {uniq}")
+    return X, y
+
 def train_svm(X_train, y_train):
-    model = SVC(kernel='', C=1, gamma=1)
-# kernel : type of kernel function ('linear', 'rbf', 'poly', 'sigmoid'), determines the shape of the decision boundary
-# C      : regularization parameter, larger C means less tolerance for misclassification
-# gamma  : kernel coefficient for 'rbf', 'poly', and 'sigmoid' (controls influence of single training points);
-    
+    model = SVC(kernel='linear', C=100)
     model.fit(X_train, y_train)
     return model
 
-# Use PCA to reduce dimensions to 2D and plot the decision boundary
-def plot_decision_boundary_pca(X, y, model, pca, file_name, xlim, ylim, predictions=None):
+def summarize(arr: np.ndarray, ndigits: int = 3):
+    def r(x):
+        return float(np.round(x, ndigits))
+    return {
+        "mean": r(np.mean(arr)),
+        "var": r(np.var(arr, ddof=1)),
+        "std": r(np.std(arr, ddof=1)),
+        "median": r(np.median(arr)),
+        "p2.5": r(np.quantile(arr, 0.025)),
+        "p97.5": r(np.quantile(arr, 0.975)),
+        "min": r(np.min(arr)),
+        "max": r(np.max(arr)),
+    }
 
-    X_pca = pca.transform(X) 
-    plt.figure(figsize=(10, 8))
+def confusion_2x2_counts(y_true, y_pred):
+    y_true = np.asarray(y_true).astype(int) - 1
+    y_pred = np.asarray(y_pred).astype(int) - 1
+    cm = np.zeros((2, 2), dtype=int)
+    for t, p in zip(y_true, y_pred):
+        cm[t, p] += 1
+    return cm
 
-    if predictions is None:
-        plt.scatter(X_pca[:, 0], X_pca[:, 1], c=y, cmap='bwr', alpha=0.5, edgecolor='k', s=400)
+def pred_true_counts(y_true, y_pred):
+    y_true = np.asarray(y_true).astype(int)
+    y_pred = np.asarray(y_pred).astype(int)
+    cm = np.zeros((2, 2), dtype=int)
+    for t, p in zip(y_true, y_pred):
+        cm[p - 1, t - 1] += 1
+    return cm
+
+def plot_confusion_matrix(cm_counts, out_tif: Path, title="Aggregated Confusion Matrix", normalize="row",
+                          cmap="GnBu", class_names=None, tick_font=32, title_font=32,
+                          annot_font=28, cbar_font=32):
+    if class_names is None:
+        class_names = ["1", "2"]
+
+    cm_counts = np.asarray(cm_counts, dtype=float)
+    if normalize == "row":
+        row_sum = cm_counts.sum(axis=1, keepdims=True)
+        cm_show = np.divide(cm_counts, row_sum, out=np.zeros_like(cm_counts), where=row_sum != 0) * 100.0
+        show_is_percent = True
+        vmin, vmax = 0.0, 100.0
     else:
-        correct = predictions == y
-        plt.scatter(X_pca[correct, 0], X_pca[correct, 1], c=y[correct], cmap='bwr', marker='o', edgecolors='k', s=400, alpha=0.5)
-        plt.scatter(X_pca[~correct, 0], X_pca[~correct, 1], c=y[~correct], cmap='bwr', marker='x', edgecolors='k', s=400)
-    
+        cm_show = cm_counts
+        show_is_percent = False
+        vmin, vmax = float(np.min(cm_show)), float(np.max(cm_show))
+
+    fig = plt.figure(figsize=(9, 7), dpi=300)
     ax = plt.gca()
+    im = ax.imshow(cm_show, cmap=cmap, vmin=vmin, vmax=vmax, alpha=0.6)
 
-    x_margin = (xlim[1] - xlim[0]) * 0.05
-    y_margin = (ylim[1] - ylim[0]) * 0.05
-    ax.set_xlim(xlim[0] - x_margin, xlim[1] + x_margin)
-    ax.set_ylim(ylim[0] - y_margin, ylim[1] + y_margin)
+    ax.set_title(title, fontsize=title_font, pad=12)
+    ax.set_xlabel("Predicted label", fontsize=tick_font, labelpad=8)
+    ax.set_ylabel("True label", fontsize=tick_font, labelpad=8)
+    ax.set_xticks([0, 1]); ax.set_yticks([0, 1])
+    ax.set_xticklabels(class_names, fontsize=tick_font)
+    ax.set_yticklabels(class_names, fontsize=tick_font)
+    ax.set_xticks(np.arange(-.5, 2, 1), minor=True)
+    ax.set_yticks(np.arange(-.5, 2, 1), minor=True)
+    ax.grid(which="minor", color="white", linestyle="-", linewidth=2)
+    ax.tick_params(which="minor", bottom=False, left=False)
 
-    xx, yy = np.meshgrid(np.linspace(xlim[0] - x_margin, xlim[1] + x_margin, 50),
-                         np.linspace(ylim[0] - y_margin, ylim[1] + y_margin, 50))
+    for i in range(2):
+        for j in range(2):
+            cnt = int(cm_counts[i, j])
+            txt = f"{cm_show[i, j]:.1f}%\n($\\mathit{{n}} $={cnt})" if show_is_percent else f"($\\mathit{{n}} $={cnt})"
+            ax.text(j, i, txt, ha="center", va="center", fontsize=annot_font)
 
-    grid_points_pca = np.c_[xx.ravel(), yy.ravel()]
-    grid_points_original = pca.inverse_transform(grid_points_pca)
+    cbar = plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+    cbar.set_label("Percentage (%)", fontsize=cbar_font, rotation=270, labelpad=18)
+    cbar.ax.tick_params(labelsize=cbar_font)
 
-    Z = model.decision_function(grid_points_original)
-    Z = Z.reshape(xx.shape)
-    
-    ax.contour(xx, yy, Z, colors='k', levels=[-1, 0, 1], alpha=0.5,
-               linestyles=['--', '-', '--'])
-    
-    plt.xlabel('PC 1')
-    plt.ylabel('PC 2')
+    plt.tight_layout(pad=0.6)
+    fig.savefig(out_tif, format="tif", bbox_inches="tight")
+    plt.close(fig)
 
-    ax.xaxis.set_major_locator(plt.MaxNLocator(6))
-    ax.yaxis.set_major_locator(plt.MaxNLocator(6))
-    ax.xaxis.set_major_formatter(plt.FuncFormatter(lambda val, pos: f'{val:.1f}'))
-    ax.yaxis.set_major_formatter(plt.FuncFormatter(lambda val, pos: f'{val:.1f}'))
-
+def plot_accuracy_hist(arr, out_tif: Path, title="Overall TEST accuracy histogram"):
+    arr = np.asarray(arr, dtype=float)
+    fig = plt.figure(figsize=(10, 8))
+    ax = plt.gca()
+    ax.hist(arr, bins=20)
+    ax.set_title(title, pad=18)
+    ax.set_xlabel("Accuracy")
+    ax.set_ylabel("Count")
     plt.tight_layout(pad=0.5)
+    fig.savefig(out_tif, format="tif", bbox_inches="tight")
+    plt.close(fig)
 
-    plt.savefig(file_name, format='tif', bbox_inches='tight')  
+def safe_to_csv(df: pd.DataFrame, out_csv: Path):
+    try:
+        df.to_csv(out_csv, index=False, encoding="utf-8-sig")
+        return out_csv
+    except PermissionError:
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        alt = out_csv.with_name(out_csv.stem + f"_{ts}" + out_csv.suffix)
+        df.to_csv(alt, index=False, encoding="utf-8-sig")
+        return alt
 
-    plt.show()
-
-# Count number of class 1 and class 2 samples on each side of decision boundary
-def count_classes_sides(X, y, model, dataset_name):
-    decision_values = model.decision_function(X)
-    left_side = decision_values < 0  # Left side of boundary
-    right_side = decision_values >= 0  # Right side of boundary
-
-    # Count on the left side
-    left_class_count = np.unique(y[left_side], return_counts=True)
-    left_class_count_dict = dict(zip(left_class_count[0], left_class_count[1]))
+def normalize_by_train_stats(X_train, X_test, method: str, y_train=None):
     
-    # Count on the right side
-    right_class_count = np.unique(y[right_side], return_counts=True)
-    right_class_count_dict = dict(zip(right_class_count[0], right_class_count[1]))
-    
-    print(f'In {dataset_name}:')
-    print(f'Left side of decision boundary (below the line):')
-    print(f'Class 1 count: {left_class_count_dict.get(1, 0)}')
-    print(f'Class 2 count: {left_class_count_dict.get(2, 0)}')
-    print('----------------------------')
-    
-    print(f'Right side of decision boundary (above the line):')
-    print(f'Class 1 count: {right_class_count_dict.get(1, 0)}')
-    print(f'Class 2 count: {right_class_count_dict.get(2, 0)}')
-    print('----------------------------')
+    if y_train is None:
+        raise ValueError("y_train is required for normalization using the 0h class in the training set")
 
-# Main function
+    y_train = np.asarray(y_train)
+    mask_0h = (y_train == 1)
+    if np.sum(mask_0h) == 0:
+        raise ValueError("No label=1 samples were found in the current training fold")
+
+    X_base = X_train[mask_0h]
+    mean = X_base.mean(axis=0)
+    var = X_base.var(axis=0, ddof=1)
+    std = np.sqrt(np.maximum(var, 0.0))
+
+    if method == "meanDiv":
+        denom = np.where(np.abs(mean) < EPS, 1.0, mean)
+        X_train_n = X_train / denom
+        X_test_n = X_test / denom
+    elif method == "zscore":
+        denom = np.where(std < EPS, 1.0, std)
+        X_train_n = (X_train - mean) / denom
+        X_test_n = (X_test - mean) / denom
+    else:
+        raise ValueError("method must be 'meanDiv' or 'zscore'")
+
+    return X_train_n, X_test_n, mean, var
+
+def normalize_self_by_own_0h(X_raw, y_raw, method: str):
+    
+    y_raw = np.asarray(y_raw)
+    mask_0h = (y_raw == 1)
+    if np.sum(mask_0h) == 0:
+        raise ValueError("No label=1 samples were found in the external data")
+
+    X_base = X_raw[mask_0h]
+    mean = X_base.mean(axis=0)
+    var = X_base.var(axis=0, ddof=1)
+    std = np.sqrt(np.maximum(var, 0.0))
+
+    if method == "meanDiv":
+        denom = np.where(np.abs(mean) < EPS, 1.0, mean)
+        X_norm = X_raw / denom
+    elif method == "zscore":
+        denom = np.where(std < EPS, 1.0, std)
+        X_norm = (X_raw - mean) / denom
+    else:
+        raise ValueError("method must be 'meanDiv' or 'zscore'")
+    return X_norm, mean, var
+
+def _axis_limits_with_margin(vec, margin_ratio=0.05):
+    lo, hi = float(np.min(vec)), float(np.max(vec))
+    span = hi - lo
+    m = span * margin_ratio if span > 0 else 1.0
+    return (lo - m, hi + m)
+
+def set_inner_five_ticks(ax, inner_low=0.03, inner_high=0.97):
+    xmin, xmax = ax.get_xlim(); ymin, ymax = ax.get_ylim()
+    xr = xmax - xmin; yr = ymax - ymin
+    xticks = np.linspace(xmin + inner_low * xr, xmin + inner_high * xr, 5)
+    yticks = np.linspace(ymin + inner_low * yr, ymin + inner_high * yr, 5)
+    ax.xaxis.set_major_locator(FixedLocator(xticks))
+    ax.yaxis.set_major_locator(FixedLocator(yticks))
+    ax.xaxis.set_major_formatter(FormatStrFormatter('%.2f'))
+    ax.yaxis.set_major_formatter(FormatStrFormatter('%.2f'))
+
+def _build_supervised_projection(X_ref, model):
+    
+    w = model.coef_.ravel().astype(float)
+    w_norm = np.linalg.norm(w)
+    if w_norm < EPS:
+        raise RuntimeError("Supervised projection failed: SVM normal vector norm is too small.")
+
+    e1 = w / w_norm
+    origin = np.mean(np.asarray(X_ref, dtype=float), axis=0)
+
+    
+    Xc = np.asarray(X_ref, dtype=float) - origin
+    X_plane = Xc - np.outer(Xc @ e1, e1)
+
+    if np.allclose(X_plane, 0.0, atol=1e-10):
+        
+        basis_pool = np.eye(X_ref.shape[1], dtype=float)
+        best_vec = None
+        best_norm = -1.0
+        for v in basis_pool:
+            v_ortho = v - np.dot(v, e1) * e1
+            nrm = np.linalg.norm(v_ortho)
+            if nrm > best_norm:
+                best_norm = nrm
+                best_vec = v_ortho
+        if best_vec is None or best_norm < EPS:
+            raise RuntimeError("Supervised projection failed: unable to construct the second axis.")
+        e2 = best_vec / best_norm
+    else:
+        
+        pca_in_plane = PCA(n_components=1, random_state=0)
+        pca_in_plane.fit(X_plane)
+        e2 = pca_in_plane.components_[0].astype(float)
+        e2 = e2 - np.dot(e2, e1) * e1
+        e2_norm = np.linalg.norm(e2)
+        if e2_norm < EPS:
+            raise RuntimeError("Supervised projection failed: second-axis normalization failed.")
+        e2 = e2 / e2_norm
+
+    return {
+        "origin": origin,
+        "e1": e1,
+        "e2": e2,
+        "w": w,
+        "b": float(model.intercept_.ravel()[0]),
+        "w_norm": float(w_norm),
+    }
+
+def _supervised_project(X, proj):
+    X = np.asarray(X, dtype=float)
+    Xc = X - proj["origin"]
+    u = Xc @ proj["e1"]
+    v = Xc @ proj["e2"]
+    return np.c_[u, v]
+
+def _decision_line_x(level, proj):
+    
+    return (level - (np.dot(proj["w"], proj["origin"]) + proj["b"])) / proj["w_norm"]
+
+def prepare_shared_pca_and_limits(X_train_for_pca, X_old_norm, X_new_norm=None, model=None):
+    if model is None:
+        raise ValueError("model is required to construct the supervised projection.")
+
+    proj = _build_supervised_projection(X_train_for_pca, model)
+    X2_old = _supervised_project(X_old_norm, proj)
+    if X_new_norm is not None:
+        X2_new = _supervised_project(X_new_norm, proj)
+        X2_comb = np.vstack([X2_old, X2_new])
+    else:
+        X2_new = None
+        X2_comb = X2_old
+
+    xlim = _axis_limits_with_margin(X2_comb[:, 0])
+    ylim = _axis_limits_with_margin(X2_comb[:, 1])
+    return proj, X2_old, X2_new, xlim, ylim
+
+def plot_representative_split_2d_pca(X_all_norm, y, train_idx, test_idx, model, pca, xlim, ylim,
+                                     out_tif: Path, pc1_label=PC1_LABEL, pc2_label=PC2_LABEL):
+    X_train, y_train = X_all_norm[train_idx], y[train_idx]
+    X_test, y_test = X_all_norm[test_idx], y[test_idx]
+    X2_all = _supervised_project(X_all_norm, pca)
+    X2_train = X2_all[train_idx]
+    X2_test = X2_all[test_idx]
+
+    fig = plt.figure(figsize=(10, 8), dpi=300)
+    ax = plt.gca()
+    ax.set_xlim(xlim); ax.set_ylim(ylim)
+    ax.scatter(X2_train[:, 0], X2_train[:, 1], c=y_train, cmap='bwr', vmin=1, vmax=2,
+               s=400, alpha=0.6, edgecolors='k', linewidths=1.5, antialiased=True)
+    for cls, color in [(1, 'blue'), (2, 'red')]:
+        m = (y_test == cls)
+        ax.scatter(X2_test[m, 0], X2_test[m, 1], facecolors='none', edgecolors=color,
+                   s=520, linewidths=2.4, marker='o', antialiased=True)
+
+    for level, ls in zip([-1, 0, 1], ['--', '-', '--']):
+        x0 = _decision_line_x(level, pca)
+        ax.plot([x0, x0], [ylim[0], ylim[1]], color='k', linestyle=ls, alpha=0.7)
+
+    ax.set_xlabel(pc1_label); ax.set_ylabel(pc2_label)
+    set_inner_five_ticks(ax, inner_low=0.03, inner_high=0.97)
+    plt.tight_layout(pad=0.5)
+    fig.savefig(out_tif, format='tif', bbox_inches='tight')
+    plt.close(fig)
+
+def plot_newdata_on_old_boundary_2d_pca(X_new_norm, y_new, model, pca, xlim, ylim,
+                                        out_tif: Path, pc1_label=PC1_LABEL, pc2_label=PC2_LABEL):
+    y_pred = model.predict(X_new_norm)
+    X2_new = _supervised_project(X_new_norm, pca)
+
+    fig = plt.figure(figsize=(10, 8), dpi=300)
+    ax = plt.gca()
+    ax.set_xlim(xlim); ax.set_ylim(ylim)
+
+    for level, ls in zip([-1, 0, 1], ['--', '-', '--']):
+        x0 = _decision_line_x(level, pca)
+        ax.plot([x0, x0], [ylim[0], ylim[1]], color='k', linestyle=ls, alpha=0.7)
+
+    for cls, color in [(1, 'blue'), (2, 'red')]:
+        m_true = (y_new == cls)
+        m_correct = m_true & (y_pred == y_new)
+        m_wrong = m_true & (y_pred != y_new)
+        if np.any(m_correct):
+            ax.scatter(X2_new[m_correct, 0], X2_new[m_correct, 1], c=color, s=400, alpha=0.6,
+                       edgecolors='k', linewidths=1.5, antialiased=True)
+        if np.any(m_wrong):
+            ax.scatter(X2_new[m_wrong, 0], X2_new[m_wrong, 1], c=color, s=520, linewidths=3.0,
+                       marker='x', alpha=0.6, antialiased=True)
+
+    ax.set_xlabel(pc1_label); ax.set_ylabel(pc2_label)
+    set_inner_five_ticks(ax, inner_low=0.03, inner_high=0.97)
+    plt.tight_layout(pad=0.5)
+    fig.savefig(out_tif, format='tif', bbox_inches='tight')
+    plt.close(fig)
+    return y_pred
+
+def plot_pred_true_matrix(cm_pred_true, out_tif: Path, total_n: int, tick_font=32, annot_font=28):
+    cm = np.asarray(cm_pred_true, dtype=float)
+    fig = plt.figure(figsize=(8, 7), dpi=300)
+    ax = plt.gca()
+    ax.imshow(np.ones((2, 2)), cmap="Greys", vmin=0, vmax=1, alpha=0.12)
+    ax.set_xticks([0, 1]); ax.set_yticks([0, 1])
+    ax.set_xticklabels(["1", "2"], fontsize=tick_font)
+    ax.set_yticklabels(["1", "2"], fontsize=tick_font)
+    ax.set_xlabel("True label", fontsize=tick_font, labelpad=8)
+    ax.set_ylabel("Predicted label", fontsize=tick_font, labelpad=8)
+    ax.set_xticks(np.arange(-.5, 2, 1), minor=True)
+    ax.set_yticks(np.arange(-.5, 2, 1), minor=True)
+    ax.grid(which="minor", color="black", linestyle="-", linewidth=1.5)
+    ax.tick_params(which="minor", bottom=False, left=False)
+    for i in range(2):
+        for j in range(2):
+            cnt = int(cm[i, j]); pct = cnt / total_n*2 * 100.0 if total_n > 0 else 0.0
+            ax.text(j, i, f"{cnt}\n{pct:.1f}%", ha="center", va="center", fontsize=annot_font)
+    plt.tight_layout(pad=0.6)
+    fig.savefig(out_tif, format="tif", bbox_inches="tight")
+    plt.close(fig)
+
+def export_rep_norm_points(method_dir: Path, method: str, rep_eval: int, X_all_norm: np.ndarray,
+                           y: np.ndarray, rep_train_idx: np.ndarray, rep_test_idx: np.ndarray):
+    out_sub = method_dir / "rep_export"
+    out_sub.mkdir(parents=True, exist_ok=True)
+    X_all_norm = np.asarray(X_all_norm)
+    y = np.asarray(y).astype(int)
+    split = np.array(["other"] * len(y), dtype=object)
+    split[rep_train_idx] = "train"; split[rep_test_idx] = "test"
+
+    df_all = pd.DataFrame({"x1": X_all_norm[:, 0], "x2": X_all_norm[:, 1], "x3": X_all_norm[:, 2],
+                           "label": y, "split": split})
+    df_train = df_all[df_all["split"] == "train"].copy()
+    df_test = df_all[df_all["split"] == "test"].copy()
+    f_all = out_sub / f"{STEM}_{method}_repEval{rep_eval}_all_norm_points.csv"
+    f_tr = out_sub / f"{STEM}_{method}_repEval{rep_eval}_train_norm_points.csv"
+    f_te = out_sub / f"{STEM}_{method}_repEval{rep_eval}_test_norm_points.csv"
+    safe_to_csv(df_all, f_all); safe_to_csv(df_train, f_tr); safe_to_csv(df_test, f_te)
+    print(f"[Saved] rep normalized points (ALL)  -> {f_all}")
+    print(f"[Saved] rep normalized points (TRAIN)-> {f_tr}")
+    print(f"[Saved] rep normalized points (TEST) -> {f_te}")
+    return out_sub
+
+def export_decision_planes_xyz(method_dir: Path, method: str, rep_eval: int, model, X_all_norm: np.ndarray, grid_n: int = 80):
+    out_sub = method_dir / "rep_export"
+    out_sub.mkdir(parents=True, exist_ok=True)
+    X_all_norm = np.asarray(X_all_norm)
+    xlim = _axis_limits_with_margin(X_all_norm[:, 0])
+    ylim = _axis_limits_with_margin(X_all_norm[:, 1])
+    zlim = _axis_limits_with_margin(X_all_norm[:, 2])
+    w = model.coef_.ravel(); b = float(model.intercept_.ravel()[0])
+    solve_idx = int(np.argmax(np.abs(w)))
+    grid_idx = [i for i in range(3) if i != solve_idx]
+    lims = [xlim, ylim, zlim]
+    u_lim = lims[grid_idx[0]]; v_lim = lims[grid_idx[1]]
+    U, V = np.meshgrid(np.linspace(u_lim[0], u_lim[1], grid_n), np.linspace(v_lim[0], v_lim[1], grid_n))
+    ws = w[solve_idx]
+    if abs(ws) < EPS:
+        raise RuntimeError("export_decision_planes_xyz: ws is too small to solve the plane stably.")
+
+    def solve_to_xyz(level: float):
+        Suv = (level - (w[grid_idx[0]] * U + w[grid_idx[1]] * V) - b) / ws
+        coords = [None, None, None]
+        coords[grid_idx[0]] = U; coords[grid_idx[1]] = V; coords[solve_idx] = Suv
+        Xs, Ys, Zs = coords[0], coords[1], coords[2]
+        mask = ((Xs >= xlim[0]) & (Xs <= xlim[1]) & (Ys >= ylim[0]) & (Ys <= ylim[1]) &
+                (Zs >= zlim[0]) & (Zs <= zlim[1]) & np.isfinite(Xs) & np.isfinite(Ys) & np.isfinite(Zs))
+        return np.c_[Xs[mask].ravel(), Ys[mask].ravel(), Zs[mask].ravel()]
+
+    for tag, lvl in {"0":0.0, "pos1":1.0, "neg1":-1.0}.items():
+        xyz = solve_to_xyz(lvl)
+        df = pd.DataFrame({"x": xyz[:, 0], "y": xyz[:, 1], "z": xyz[:, 2]})
+        out_csv = out_sub / f"{STEM}_{method}_repEval{rep_eval}_plane_level_{tag}.csv"
+        safe_to_csv(df, out_csv)
+        print(f"[Saved] decision plane xyz (level={lvl:+.0f}) -> {out_csv}   (n={len(df)})")
+
+    meta = {
+        "stem": STEM, "method": method, "rep_eval": int(rep_eval), "grid_n": int(grid_n),
+        "xlim": [float(xlim[0]), float(xlim[1])], "ylim": [float(ylim[0]), float(ylim[1])],
+        "zlim": [float(zlim[0]), float(zlim[1])], "solve_idx": int(solve_idx),
+        "grid_idx": [int(grid_idx[0]), int(grid_idx[1])]
+    }
+    meta_path = out_sub / f"{STEM}_{method}_repEval{rep_eval}_plane_meta.json"
+    meta_path.write_text(json.dumps(meta, indent=2, ensure_ascii=False), encoding="utf-8")
+    print(f"[Saved] plane meta -> {meta_path}")
+
+def export_origin_summary_csv(method_dir: Path, method: str, rep_eval: int, model, X_all_norm: np.ndarray,
+                              y: np.ndarray, rep_train_idx: np.ndarray, rep_test_idx: np.ndarray, grid_n: int = 80):
+    out_sub = method_dir / "rep_export"
+    out_sub.mkdir(parents=True, exist_ok=True)
+    X_all_norm = np.asarray(X_all_norm, dtype=float)
+    y = np.asarray(y).astype(int)
+    xlim = _axis_limits_with_margin(X_all_norm[:, 0])
+    ylim = _axis_limits_with_margin(X_all_norm[:, 1])
+    zlim = _axis_limits_with_margin(X_all_norm[:, 2])
+    w = model.coef_.ravel(); b = float(model.intercept_.ravel()[0])
+    solve_idx = int(np.argmax(np.abs(w)))
+    grid_idx = [i for i in range(3) if i != solve_idx]
+    lims = [xlim, ylim, zlim]
+    u_lim = lims[grid_idx[0]]; v_lim = lims[grid_idx[1]]
+    U, V = np.meshgrid(np.linspace(u_lim[0], u_lim[1], grid_n), np.linspace(v_lim[0], v_lim[1], grid_n))
+    ws = w[solve_idx]
+    if abs(ws) < EPS:
+        raise RuntimeError("export_origin_summary_csv: ws is too small to solve the plane stably.")
+
+    def solve_plane_xyz(level: float):
+        Suv = (level - (w[grid_idx[0]] * U + w[grid_idx[1]] * V) - b) / ws
+        coords = [None, None, None]
+        coords[grid_idx[0]] = U; coords[grid_idx[1]] = V; coords[solve_idx] = Suv
+        Xs, Ys, Zs = coords[0], coords[1], coords[2]
+        mask = ((Xs >= xlim[0]) & (Xs <= xlim[1]) & (Ys >= ylim[0]) & (Ys <= ylim[1]) &
+                (Zs >= zlim[0]) & (Zs <= zlim[1]) & np.isfinite(Xs) & np.isfinite(Ys) & np.isfinite(Zs))
+        return np.c_[Xs[mask].ravel(), Ys[mask].ravel(), Zs[mask].ravel()]
+
+    plane0 = solve_plane_xyz(0.0)
+    plane_p1 = solve_plane_xyz(1.0)
+    plane_n1 = solve_plane_xyz(-1.0)
+    X_train = X_all_norm[rep_train_idx]; y_train = y[rep_train_idx]
+    X_test = X_all_norm[rep_test_idx]; y_test = y[rep_test_idx]
+    train_label1 = X_train[y_train == 1]
+    train_label2 = X_train[y_train == 2]
+    test_label1 = X_test[y_test == 1]
+    test_label2 = X_test[y_test == 2]
+
+    max_len = max(len(plane0), len(plane_p1), len(plane_n1), len(train_label1), len(train_label2), len(test_label1), len(test_label2))
+
+    def pad_xyz(arr, n_rows):
+        arr = np.asarray(arr, dtype=float)
+        out = np.full((n_rows, 3), np.nan, dtype=float)
+        if arr.size != 0:
+            out[:len(arr), :] = arr[:, :3]
+        return out
+
+    p0 = pad_xyz(plane0, max_len); pp = pad_xyz(plane_p1, max_len); pn = pad_xyz(plane_n1, max_len)
+    tr1 = pad_xyz(train_label1, max_len); tr2 = pad_xyz(train_label2, max_len)
+    te1 = pad_xyz(test_label1, max_len); te2 = pad_xyz(test_label2, max_len)
+
+    df_sum = pd.DataFrame({
+        "plane0_x": p0[:, 0], "plane0_y": p0[:, 1], "plane0_z": p0[:, 2],
+        "plane_pos1_x": pp[:, 0], "plane_pos1_y": pp[:, 1], "plane_pos1_z": pp[:, 2],
+        "plane_neg1_x": pn[:, 0], "plane_neg1_y": pn[:, 1], "plane_neg1_z": pn[:, 2],
+        "train_label1_x": tr1[:, 0], "train_label1_y": tr1[:, 1], "train_label1_z": tr1[:, 2],
+        "train_label2_x": tr2[:, 0], "train_label2_y": tr2[:, 1], "train_label2_z": tr2[:, 2],
+        "test_label1_x": te1[:, 0], "test_label1_y": te1[:, 1], "test_label1_z": te1[:, 2],
+        "test_label2_x": te2[:, 0], "test_label2_y": te2[:, 1], "test_label2_z": te2[:, 2],
+    })
+    out_csv = out_sub / f"{STEM}_{method}_repEval{rep_eval}_origin_summary_xyz.csv"
+    saved = safe_to_csv(df_sum, out_csv)
+    print(f"[Saved] origin summary xyz CSV -> {saved}")
+    return saved
+
+def export_origin_summary_csv_new(method_dir: Path, method: str, rep_eval: int, model, axis_ref_X: np.ndarray,
+                                  X_new_norm: np.ndarray, y_new: np.ndarray, y_new_pred: np.ndarray,
+                                  grid_n: int = 80):
+    out_sub = method_dir / "rep_export"
+    out_sub.mkdir(parents=True, exist_ok=True)
+    axis_ref_X = np.asarray(axis_ref_X, dtype=float)
+    X_new_norm = np.asarray(X_new_norm, dtype=float)
+    y_new = np.asarray(y_new).astype(int)
+    y_new_pred = np.asarray(y_new_pred).astype(int)
+
+    xlim = _axis_limits_with_margin(axis_ref_X[:, 0])
+    ylim = _axis_limits_with_margin(axis_ref_X[:, 1])
+    zlim = _axis_limits_with_margin(axis_ref_X[:, 2])
+    w = model.coef_.ravel(); b = float(model.intercept_.ravel()[0])
+    solve_idx = int(np.argmax(np.abs(w)))
+    grid_idx = [i for i in range(3) if i != solve_idx]
+    lims = [xlim, ylim, zlim]
+    u_lim = lims[grid_idx[0]]; v_lim = lims[grid_idx[1]]
+    U, V = np.meshgrid(np.linspace(u_lim[0], u_lim[1], grid_n), np.linspace(v_lim[0], v_lim[1], grid_n))
+    ws = w[solve_idx]
+    if abs(ws) < EPS:
+        raise RuntimeError("export_origin_summary_csv_new: ws is too small to solve the plane stably.")
+
+    def solve_plane_xyz(level: float):
+        Suv = (level - (w[grid_idx[0]] * U + w[grid_idx[1]] * V) - b) / ws
+        coords = [None, None, None]
+        coords[grid_idx[0]] = U; coords[grid_idx[1]] = V; coords[solve_idx] = Suv
+        Xs, Ys, Zs = coords[0], coords[1], coords[2]
+        mask = ((Xs >= xlim[0]) & (Xs <= xlim[1]) & (Ys >= ylim[0]) & (Ys <= ylim[1]) &
+                (Zs >= zlim[0]) & (Zs <= zlim[1]) & np.isfinite(Xs) & np.isfinite(Ys) & np.isfinite(Zs))
+        return np.c_[Xs[mask].ravel(), Ys[mask].ravel(), Zs[mask].ravel()]
+
+    plane0 = solve_plane_xyz(0.0)
+    plane_p1 = solve_plane_xyz(1.0)
+    plane_n1 = solve_plane_xyz(-1.0)
+    g1c = X_new_norm[(y_new == 1) & (y_new_pred == 1)]
+    g2c = X_new_norm[(y_new == 2) & (y_new_pred == 2)]
+    g1w = X_new_norm[(y_new == 1) & (y_new_pred != 1)]
+    g2w = X_new_norm[(y_new == 2) & (y_new_pred != 2)]
+
+    max_len = max(len(plane0), len(plane_p1), len(plane_n1), len(g1c), len(g2c), len(g1w), len(g2w))
+
+    def pad_xyz(arr, n_rows):
+        arr = np.asarray(arr, dtype=float)
+        out = np.full((n_rows, 3), np.nan, dtype=float)
+        if arr.size != 0:
+            out[:len(arr), :] = arr[:, :3]
+        return out
+
+    p0 = pad_xyz(plane0, max_len); pp = pad_xyz(plane_p1, max_len); pn = pad_xyz(plane_n1, max_len)
+    a = pad_xyz(g1c, max_len); b2 = pad_xyz(g2c, max_len); c = pad_xyz(g1w, max_len); d = pad_xyz(g2w, max_len)
+
+    df_sum = pd.DataFrame({
+        "plane0_x": p0[:, 0], "plane0_y": p0[:, 1], "plane0_z": p0[:, 2],
+        "plane_pos1_x": pp[:, 0], "plane_pos1_y": pp[:, 1], "plane_pos1_z": pp[:, 2],
+        "plane_neg1_x": pn[:, 0], "plane_neg1_y": pn[:, 1], "plane_neg1_z": pn[:, 2],
+        "new_true1_correct_x": a[:, 0], "new_true1_correct_y": a[:, 1], "new_true1_correct_z": a[:, 2],
+        "new_true2_correct_x": b2[:, 0], "new_true2_correct_y": b2[:, 1], "new_true2_correct_z": b2[:, 2],
+        "new_true1_wrong_x": c[:, 0], "new_true1_wrong_y": c[:, 1], "new_true1_wrong_z": c[:, 2],
+        "new_true2_wrong_x": d[:, 0], "new_true2_wrong_y": d[:, 1], "new_true2_wrong_z": d[:, 2],
+    })
+    out_csv = out_sub / f"{NEW_STEM}_{method}_repEval{rep_eval}_origin_summary_xyz.csv"
+    saved = safe_to_csv(df_sum, out_csv)
+    print(f"[Saved] NEW origin summary xyz CSV -> {saved}")
+    return saved
+
+def run_one_normalization(X, y, method: str, method_dir: Path):
+    method_dir.mkdir(parents=True, exist_ok=True)
+    cv = RepeatedStratifiedKFold(n_splits=N_SPLITS, n_repeats=N_REPEATS, random_state=SEED)
+    n_eval = N_SPLITS * N_REPEATS
+    acc1_test = np.empty(n_eval); acc2_test = np.empty(n_eval); acc_all_test = np.empty(n_eval)
+    acc1_train = np.empty(n_eval); acc2_train = np.empty(n_eval); acc_all_train = np.empty(n_eval)
+    cm_test_total = np.zeros((2, 2), dtype=int); cm_train_total = np.zeros((2, 2), dtype=int)
+    splits = []; rep_ids = np.empty(n_eval, dtype=int); fold_ids = np.empty(n_eval, dtype=int)
+
+    eval_i = 0
+    for split_i, (train_idx, test_idx) in enumerate(cv.split(X, y)):
+        rep_id = split_i // N_SPLITS; fold_id = split_i % N_SPLITS
+        X_tr_raw = X[train_idx]; X_te_raw = X[test_idx]
+        y_tr = y[train_idx]; y_te = y[test_idx]
+        X_tr, X_te, _, _ = normalize_by_train_stats(X_tr_raw, X_te_raw, method, y_tr)
+        model = train_svm(X_tr, y_tr)
+
+        pred_test = model.predict(X_te)
+        cm_test_total += confusion_2x2_counts(y_te, pred_test)
+        m1t = (y_te == 1); m2t = (y_te == 2)
+        acc1_test[eval_i] = (pred_test[m1t] == y_te[m1t]).mean()
+        acc2_test[eval_i] = (pred_test[m2t] == y_te[m2t]).mean()
+        acc_all_test[eval_i] = (pred_test == y_te).mean()
+
+        pred_train = model.predict(X_tr)
+        cm_train_total += confusion_2x2_counts(y_tr, pred_train)
+        m1r = (y_tr == 1); m2r = (y_tr == 2)
+        acc1_train[eval_i] = (pred_train[m1r] == y_tr[m1r]).mean()
+        acc2_train[eval_i] = (pred_train[m2r] == y_tr[m2r]).mean()
+        acc_all_train[eval_i] = (pred_train == y_tr).mean()
+
+        splits.append((train_idx, test_idx)); rep_ids[eval_i] = rep_id; fold_ids[eval_i] = fold_id; eval_i += 1
+
+    print("\n============================================================")
+    print(f"Normalization: {method}")
+    print("========== Repeated Stratified 4-fold CV statistics (accuracy only) ==========")
+    print(f"DATA_FILE: {DATA_FILE.name}")
+    print(f"OUT_DIR: {method_dir.resolve()}")
+    print(f"n_splits={N_SPLITS}, n_repeats={N_REPEATS}, total_evals={n_eval}, SEED={SEED}\n")
+    print("----- Test set accuracy (across all folds & repeats) -----")
+    print("Class 1 test accuracy:", summarize(acc1_test))
+    print("Class 2 test accuracy:", summarize(acc2_test))
+    print("Overall test accuracy:", summarize(acc_all_test))
+    print("\n----- Train set accuracy (across all folds & repeats) -----")
+    print("Class 1 train accuracy:", summarize(acc1_train))
+    print("Class 2 train accuracy:", summarize(acc2_train))
+    print("Overall train accuracy:", summarize(acc_all_train))
+
+    print("\n========== Aggregated Confusion Matrix (across all folds & repeats) ==========")
+    print("TEST (counts):\n", cm_test_total)
+    print("TRAIN (counts):\n", cm_train_total)
+    cm_test_row = cm_test_total / cm_test_total.sum(axis=1, keepdims=True)
+    cm_train_row = cm_train_total / cm_train_total.sum(axis=1, keepdims=True)
+    print("\nTEST (row-normalized, %):\n", np.round(cm_test_row * 100, 2))
+    print("TRAIN (row-normalized, %):\n", np.round(cm_train_row * 100, 2))
+
+    cm_out_csv = method_dir / f"{STEM}_{method}_svm_cm_agg_repeated{N_REPEATS}x{N_SPLITS}fold.csv"
+    cm_df = pd.DataFrame({
+        "matrix": ["TEST_counts", "TEST_row_%", "TRAIN_counts", "TRAIN_row_%"],
+        "11": [cm_test_total[0, 0], cm_test_row[0, 0] * 100, cm_train_total[0, 0], cm_train_row[0, 0] * 100],
+        "12": [cm_test_total[0, 1], cm_test_row[0, 1] * 100, cm_train_total[0, 1], cm_train_row[0, 1] * 100],
+        "21": [cm_test_total[1, 0], cm_test_row[1, 0] * 100, cm_train_total[1, 0], cm_train_row[1, 0] * 100],
+        "22": [cm_test_total[1, 1], cm_test_row[1, 1] * 100, cm_train_total[1, 1], cm_train_row[1, 1] * 100],
+    })
+    saved_cm_csv = safe_to_csv(cm_df, cm_out_csv)
+    print(f"\n[Saved] aggregated confusion matrix CSV -> {saved_cm_csv}")
+    out_cm_test_tif = method_dir / f"{STEM}_{method}_svm_cm_TEST_agg_rowPct_repeated{N_REPEATS}x{N_SPLITS}fold.tif"
+    out_cm_train_tif = method_dir / f"{STEM}_{method}_svm_cm_TRAIN_agg_rowPct_repeated{N_REPEATS}x{N_SPLITS}fold.tif"
+    plot_confusion_matrix(cm_test_total, out_cm_test_tif, title=title_TEST, normalize="row", class_names=CLASS_NAMES)
+    plot_confusion_matrix(cm_train_total, out_cm_train_tif, title=title_TRAIN, normalize="row", class_names=CLASS_NAMES)
+    print(f"[Saved] confusion matrix plot (TEST) -> {out_cm_test_tif}")
+    print(f"[Saved] confusion matrix plot (TRAIN) -> {out_cm_train_tif}")
+
+    out_hist_tif = method_dir / f"{STEM}_{method}_svm_overallTESTacc_hist_{n_eval}_evals.tif"
+    plot_accuracy_hist(acc_all_test, out_hist_tif, title=f"Overall TEST accuracy histogram ({method}, {n_eval} evals)")
+    print(f"[Saved] overall test accuracy histogram -> {out_hist_tif}")
+
+    out_csv = method_dir / f"{STEM}_{method}_svm_repeated{N_REPEATS}x{N_SPLITS}fold_results.csv"
+    out_df = pd.DataFrame({
+        "eval_id": np.arange(n_eval), "repeat_id": rep_ids, "fold_id": fold_ids,
+        "acc_class1_test": acc1_test, "acc_class2_test": acc2_test, "acc_overall_test": acc_all_test,
+        "acc_class1_train": acc1_train, "acc_class2_train": acc2_train, "acc_overall_train": acc_all_train,
+    })
+    saved_csv = safe_to_csv(out_df, out_csv)
+    print(f"\n[Saved] CV results CSV -> {saved_csv}")
+
+    med_class2 = float(np.median(acc2_test))
+    rep_eval = int(np.argmin(np.abs(acc2_test - med_class2)))
+    rep_train_idx, rep_test_idx = splits[rep_eval]
+    X_tr_raw = X[rep_train_idx]; X_te_raw = X[rep_test_idx]; y_tr = y[rep_train_idx]
+    X_tr, _, mean_rep, var_rep = normalize_by_train_stats(X_tr_raw, X_te_raw, method, y_tr)
+    rep_model = train_svm(X_tr, y_tr)
+    _, X_all_norm, _, _ = normalize_by_train_stats(X_tr_raw, X, method, y_tr)
+
+    X_new_raw, y_new, X_new_norm = None, None, None
+    if NEW_DATA_FILE.exists():
+        X_new_raw, y_new = load_external_data(str(NEW_DATA_FILE))
+        X_new_norm, new_mean, new_var = normalize_self_by_own_0h(X_new_raw, y_new, method)
+
+    pca, _, _, shared_xlim, shared_ylim = prepare_shared_pca_and_limits(X_tr, X_all_norm, X_new_norm, model=rep_model)
+    out_tif_2d = method_dir / f"{STEM}_{method}_svm_repEval_eval{rep_eval}_2D_PCA_acc{acc_all_test[rep_eval]:.2f}.tif"
+    plot_representative_split_2d_pca(X_all_norm, y, rep_train_idx, rep_test_idx, rep_model, pca, shared_xlim, shared_ylim, out_tif_2d)
+    print(f"[Saved] representative eval plot (2D PCA, shared axis) -> {out_tif_2d}")
+
+    print(f"Representative eval={rep_eval}, repeat={rep_ids[rep_eval]}, fold={fold_ids[rep_eval]}, "
+          f"class2_test_acc={acc2_test[rep_eval]:.3f} (median={med_class2:.3f}), "
+          f"overall_test_acc={acc_all_test[rep_eval]:.3f}, overall_train_acc={acc_all_train[rep_eval]:.3f}")
+
+    rep_export_dir = export_rep_norm_points(method_dir=method_dir, method=method, rep_eval=rep_eval,
+                                            X_all_norm=X_all_norm, y=y,
+                                            rep_train_idx=rep_train_idx, rep_test_idx=rep_test_idx)
+    export_decision_planes_xyz(method_dir=method_dir, method=method, rep_eval=rep_eval, model=rep_model,
+                               X_all_norm=X_all_norm, grid_n=PLANE_GRID_N)
+    export_origin_summary_csv(method_dir=method_dir, method=method, rep_eval=rep_eval, model=rep_model,
+                              X_all_norm=X_all_norm, y=y, rep_train_idx=rep_train_idx,
+                              rep_test_idx=rep_test_idx, grid_n=PLANE_GRID_N)
+
+    std_rep = np.sqrt(np.maximum(var_rep, 0.0))
+    stats = {"method": method, "rep_eval": int(rep_eval),
+             "train_0h_mean": mean_rep.tolist(), "train_0h_var": var_rep.tolist(), "train_0h_std": std_rep.tolist()}
+    stats_path = rep_export_dir / f"{STEM}_{method}_repEval{rep_eval}_train_norm_stats.json"
+    stats_path.write_text(json.dumps(stats, indent=2, ensure_ascii=False), encoding="utf-8")
+    print(f"[Saved] rep train normalization stats -> {stats_path}")
+
+    if X_new_norm is not None:
+
+        out_new_plot_2d = method_dir / f"{NEW_STEM}_{method}_oldBoundary_repEval{rep_eval}_2D_PCA_points.tif"
+        y_new_pred = plot_newdata_on_old_boundary_2d_pca(X_new_norm, y_new, rep_model, pca, shared_xlim, shared_ylim,
+                                                         out_new_plot_2d, pc1_label=PC1_LABEL, pc2_label=PC2_LABEL)
+        print(f"[Saved] new-data-on-old-boundary plot (2D PCA) -> {out_new_plot_2d}")
+
+        cm_pred_true = pred_true_counts(y_new, y_new_pred)
+        out_new_cm = method_dir / f"{NEW_STEM}_{method}_oldBoundary_repEval{rep_eval}_predByTrue_matrix.tif"
+        plot_pred_true_matrix(cm_pred_true, out_new_cm, total_n=len(y_new))
+        print(f"[Saved] new-data pred-by-true matrix plot -> {out_new_cm}")
+
+        out_new_csv = method_dir / f"{NEW_STEM}_{method}_oldBoundary_repEval{rep_eval}_predictions.csv"
+        df_new = pd.DataFrame({"x1_norm": X_new_norm[:, 0], "x2_norm": X_new_norm[:, 1], "x3_norm": X_new_norm[:, 2],
+                               "true_label": y_new, "pred_label": y_new_pred})
+        safe_to_csv(df_new, out_new_csv)
+
+        out_new_cm_csv = method_dir / f"{NEW_STEM}_{method}_oldBoundary_repEval{rep_eval}_predByTrue_counts.csv"
+        df_cm_new = pd.DataFrame(cm_pred_true, index=["pred_1", "pred_2"], columns=["true_1", "true_2"])
+        safe_to_csv(df_cm_new, out_new_cm_csv)
+
+        export_origin_summary_csv_new(method_dir=method_dir, method=method, rep_eval=rep_eval, model=rep_model,
+                                      axis_ref_X=X_all_norm, X_new_norm=X_new_norm, y_new=y_new,
+                                      y_new_pred=y_new_pred, grid_n=PLANE_GRID_N)
+    else:
+        print(f"[Skip] External data file not found: {NEW_DATA_FILE}")
+
 def main():
-    train_csv = 'xxx.csv'
-    test_csv = 'xxx.csv'
-    
-    data_train = load_data(train_csv)
-    data_test = load_data(test_csv)
+    data_path = Path(DATA_FILE)
+    if not data_path.exists():
+        raise FileNotFoundError(f"File not found: {data_path.resolve()}")
+    X, y = load_data(str(data_path))
+    method_map = {"meanDiv": OUT_DIR / "norm_meanDiv", "zscore": OUT_DIR / "norm_zscore"}
+    for method, method_dir in method_map.items():
+        run_one_normalization(X, y, method=method, method_dir=method_dir)
 
-    X_train = data_train.iloc[:, :3].values 
-    y_train = data_train.iloc[:, 3].values  
-
-    X_test = data_test.iloc[:, :3].values 
-    y_test = data_test.iloc[:, 3].values  
-    
-    # Normalize each dataset using the mean of the first 50% of rows
-    half_train = X_train.shape[0] // 2
-    mean_train_first_half = X_train[:half_train].mean(axis=0)
-    X_train = X_train / mean_train_first_half
-
-    half_test = X_test.shape[0] // 2
-    mean_test_first_half = X_test[:half_test].mean(axis=0)
-    X_test = X_test / mean_test_first_half
-
-    # Train model
-    model = train_svm(X_train, y_train)
-    
-    # Count class distribution on both sides of decision boundary (training set)
-    count_classes_sides(X_train, y_train, model, 'Training Set')
-    
-    # PCA
-    pca = PCA(n_components=2)
-    X_train_pca = pca.fit_transform(X_train)
-    X_test_pca = pca.transform(X_test)
-
-    combined_x = np.concatenate([X_train_pca[:, 0], X_test_pca[:, 0]])
-    combined_y = np.concatenate([X_train_pca[:, 1], X_test_pca[:, 1]])
-    xlim = [combined_x.min(), combined_x.max()]
-    ylim = [combined_y.min(), combined_y.max()]
-
-    train_tif = os.path.splitext(train_csv)[0] + '.tif'
-    plot_decision_boundary_pca(X_train, y_train, model, pca, train_tif, xlim, ylim)
-    
-    # Predict test data
-    test_predictions = model.predict(X_test)
-
-    # Count class distribution on both sides of decision boundary (test set)
-    count_classes_sides(X_test, y_test, model, 'Test Set')
-
-    test_tif = os.path.splitext(test_csv)[0] + '.tif'
-    plot_decision_boundary_pca(X_test, y_test, model, pca, test_tif, xlim, ylim, predictions=test_predictions)
-
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()
